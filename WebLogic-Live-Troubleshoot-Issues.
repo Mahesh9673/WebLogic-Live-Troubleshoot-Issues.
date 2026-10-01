@@ -1,1 +1,208 @@
 # WebLogic-Live-Troubleshoot-Issues.
+
+
+LIVE TROUBLESHOOTING — CASE 1
+Client reports:
+Application is very slow. Some pages are taking 30–60 seconds to load.
+
+1) Check OHS
+         ps -ef |grep httpd
+        ss -lntp |grep 9443 (check listening port)
+        Test locally:- curl -klv https://$OHS_IP:9443
+Check OHS Error/acess log:
+       tail -f $ORACLE_INSTANCE/diagnostics/logs/OHS/ohs1/ohs1.log
+
+   if u see "mod_wl_ohs: weblogic connection timeout" 
+          it is clue,not root cause . It tell OHS is waiting for WebLogic.
+
+
+2) Test OHS--->WebLogic
+    from OHS:
+           nc -zv 10.10.10.21 8001
+           nc -zv 10.10.10.22 8001
+
+Both reuturns connection succedded. So then OHS-->WebLogic TCP Connectivity Working fine.
+
+Now Test Directly:
+
+curl -v http://10.10.10.21:8001/myapp/
+curl -v http://10.10.10.22:8001/myapp/
+
+If both takes 35-50 seconds. then it is good (so probably issue is not between OHS-->WebLogic)
+
+Step 3 — Check WebLogic runtime
+Environment → Servers→ MS1 → Monitoring
+
+Look for:
+           Threads
+           JVM Performance
+         Data Sources / Resource Performance
+
+Check Hogging Threads, Stuck Threads, Standby Threads and Throughput for the WebLogic thread pool.
+ Hogging Threads :- A hogging thread is a thread currently held by a request; WebLogic can later classify it as stuck depending on how long it remains busy.
+Stuck Threads :- if too many then, need to take thread Dump.
+Idle Threads :- it is fresh thread waiting for request.
+
+Step 4 — Take thread dumps
+            jstack -l 24581 > /tmp/MS1_td_01.txt
+            sleep 10
+            jstack -l 24581 > /tmp/MS1_td_02.txt
+            sleep 10
+            jstack -l 24581 > /tmp/MS1_td_03.txt    
+
+
+If the same threads have the same stack trace across all three dumps, that's a very strong indication they're consistently spending time in that operation.
+
+E.g:-1  ExecuteThread -->DAO--->PostgreSQL query -->RUNNABLE
+
+"[ACTIVE] ExecuteThread: '21' for queue:
+'weblogic.kernel.Default (self-tuning)'"
+  RUNNABLE
+
+    at org.postgresql.core.v3.QueryExecutorImpl.execute(...)
+    at org.postgresql.jdbc.PgStatement.execute(...)
+    at com.example.dao.CustomerDAO.getCustomer(...)
+    at com.example.service.CustomerService.getCustomer(...)
+    at com.example.web.CustomerServlet.doGet(...)
+
+E.g 2: ExecuteThread--->JDBC ConnectionPool.reserve()--->WAITING
+
+"[ACTIVE] ExecuteThread: '24' for queue:
+'weblogic.kernel.Default (self-tuning)'"
+  WAITING
+
+    at java.lang.Object.wait(Native Method)
+    at weblogic.jdbc.wrapper.PoolConnection.reserve(...)
+    at weblogic.jdbc.common.internal.ConnectionPool.reserve(...)
+    at com.example.dao.OrderDAO.getOrders(...)
+
+E.g 3: ExecuteThread--->JDBC ConnectionPool.reserve()--->WAITING
+
+"[ACTIVE] ExecuteThread: '31' for queue:
+'weblogic.kernel.Default (self-tuning)'"
+  WAITING
+
+    at weblogic.jdbc.common.internal.ConnectionPool.reserve(...)
+    at com.example.service.PaymentService.process(...)
+
+If see above Dumps it is pointing :-
+Application
+     ↓
+JDBC
+     ↓
+Database
+     ↓
+Long-running SQL
+     ↓
+Connections remain occupied
+     ↓
+Pool becomes exhausted
+     ↓
+Other WebLogic threads wait
+     ↓
+Application becomes slow
+
+Now We need to check on console Dataosurce connection pool.
+
+DataSource: jdbc/APPDB
+
+Current Capacity:       100
+Active Connections:     100
+Available Connections:    0
+Waiting Requests:        38
+Maximum Capacity:       100
+
+Now you can confidently say:  JDBC connection pool is exhausted.
+
+But pool exhaustion is a symptom.
+We still need to answer:
+WHY are all 100 connections occupied?
+Possible Causes:
+
+Case A → Long-running SQL
+Case B → Database is slow
+Case C → Connection leak
+Case D → Application traffic spike
+Case E → Deadlock / transaction waiting
+Case F → External service call while holding DB connection
+Case G → Pool incorrectly sized
+
+Case A — Long-running SQL
+Suppose DBA gives us some queries are in long running/.
+And many application threads are waiting for JDBC connections.
+
+Case B — CPU High
+top:-
+         java    PID 24581
+         CPU     98%
+top -H -p 24581:-
+             PID       TID      %CPU
+             24581     24602    92%
+             24581     24615     2%
+             24581     24622     1%
+
+Process PID = 24581
+Hot OS thread TID = 24602
+
+Convert TID to hexadecimal:  printf "%x\n" 24602 ---------> 601a
+Then search the Java thread dump:
+                                 grep -i "0x601a" thread_dump.txt
+
+Case C — BLOCKED threads
+
+"ExecuteThread-21" BLOCKED
+    waiting to lock <0x000000076ab123>
+
+"ExecuteThread-22" BLOCKED
+    waiting to lock <0x000000076ab123>
+
+"ExecuteThread-23" BLOCKED
+    waiting to lock <0x000000076ab123>
+
+"ExecuteThread-24" BLOCKED
+    waiting to lock <0x000000076ab123>
+
+
+Now u search "0x000000076ab123" then check who owns it for below.
+"ExecuteThread-10"
+    - locked <0x000000076ab123>
+
+This tells 
+ Thread 10 -owns Lock-->0x000000076ab123 --->Threads 21,22,23,24 are in WAITING.
+
+this is called ""Threads are blocked.""
+
+
+Case D — WAITING threads
+
+ExecuteThread-21 WAITING
+    at weblogic.jdbc.common.internal.ConnectionPool.reserve()
+
+ExecuteThread-22 WAITING
+    at weblogic.jdbc.common.internal.ConnectionPool.reserve()
+
+ExecuteThread-23 WAITING
+    at weblogic.jdbc.common.internal.ConnectionPool.reserve()
+
+
+Case E — Memory / GC
+
+jstat -gcutil 24581 5000 10
+
+shows:
+ S0    S1     E     O     M     CCS    YGC   YGCT   FGC   FGCT
+ 0.0   78.2  95.1  94.8  96.2  91.1    520   25.2    42   85.4
+
+
+Case F — Deadlock
+
+Found one Java-level deadlock:
+
+"ExecuteThread-15":
+  waiting to lock monitor A
+  which is held by "ExecuteThread-16"
+
+"ExecuteThread-16":
+  waiting to lock monitor B
+  which is held by "ExecuteThread-15"
+
